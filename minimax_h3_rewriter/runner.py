@@ -202,6 +202,28 @@ def free_comfy_vram(device: str = "auto") -> None:
         mm.soft_empty_cache(force=True)
     except Exception:
         log.debug("[minimax_h3_rewriter.runner.free_comfy_vram] skipped", exc_info=True)
+    release_cached_memory()
+
+
+def release_cached_memory() -> None:
+    """Hand back what the allocator and Python still hold after the models are gone.
+
+    ``unload_all_models`` moves weights off the card but leaves the caching
+    allocator's blocks (and anything a dropped reference has not yet freed)
+    reserved; an external server then sees that memory as taken.
+    """
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        log.debug("[minimax_h3_rewriter.runner.release_cached_memory] skipped", exc_info=True)
 
 
 # A local GPU gateway (one backend on the card at a time) can hold a model this

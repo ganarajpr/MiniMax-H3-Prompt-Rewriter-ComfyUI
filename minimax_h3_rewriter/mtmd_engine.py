@@ -465,8 +465,8 @@ def session(
     )
     if server is None and ninfer:
         raise RuntimeError(
-            f"ninfer-serve could not start {os.path.basename(model_path)}; the reason is in the "
-            "ComfyUI log above (minimax_h3_rewriter.server_engine)."
+            f"ninfer-serve could not start {os.path.basename(model_path)}: "
+            f"{server_engine.LAST_FAILURE or 'the reason is in the ComfyUI log above (minimax_h3_rewriter.server_engine).'}"
         )
     try:
         yield server

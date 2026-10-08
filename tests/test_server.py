@@ -308,3 +308,116 @@ def test_no_opinion_and_a_deliberate_none_are_not_the_same_thing():
 
     signature = inspect.signature(mtmd_engine.describe)
     assert signature.parameters["system_prompt"].default is None
+
+
+FATAL = (
+    "FATAL cuda: automatic KV capacity requires 4506776321 bytes total (3433034497 minimum + "
+    "1073741824 automatic headroom), but only 4105699328 bytes are available after weights"
+)
+
+
+def test_the_ninfer_command_names_its_headroom(monkeypatch):
+    monkeypatch.delenv(server_engine.NINFER_HEADROOM_ENV, raising=False)
+    command = server_engine.build_ninfer_command("ninfer-serve", "m.ninfer", 1, 32768, 2)
+    at = command.index("--vram-headroom-mib")
+    assert command[at + 1] == str(server_engine.NINFER_HEADROOM_MIB)
+    assert command[command.index("--kv-capacity") + 1] == "auto"
+
+
+def test_the_headroom_can_be_set_from_the_environment(monkeypatch):
+    monkeypatch.setenv(server_engine.NINFER_HEADROOM_ENV, "128")
+    command = server_engine.build_ninfer_command("ninfer-serve", "m.ninfer", 1, 32768, 2)
+    assert command[command.index("--vram-headroom-mib") + 1] == "128"
+    monkeypatch.setenv(server_engine.NINFER_HEADROOM_ENV, "lots")
+    command = server_engine.build_ninfer_command("ninfer-serve", "m.ninfer", 1, 32768, 2)
+    assert command[command.index("--vram-headroom-mib") + 1] == str(server_engine.NINFER_HEADROOM_MIB)
+
+
+def test_the_kv_failure_is_read_from_the_servers_own_words():
+    shortfall = server_engine.kv_shortfall("noise\n" + FATAL + "\nmore")
+    assert shortfall == {"total": 4506776321, "minimum": 3433034497,
+                         "headroom": 1073741824, "available": 4105699328}
+    assert server_engine.kv_shortfall("some other failure") is None
+
+
+def test_the_logged_failure_fits_with_a_smaller_headroom():
+    shortfall = server_engine.kv_shortfall(FATAL)
+    fitted = server_engine.fit_headroom(shortfall)
+    assert 0 <= fitted < 1024
+    assert shortfall["minimum"] + (fitted << 20) <= shortfall["available"]
+
+
+def test_no_headroom_fits_when_even_the_minimum_does_not():
+    shortfall = {"total": 5, "minimum": 4 << 30, "headroom": 1 << 30, "available": 3 << 30}
+    assert server_engine.fit_headroom(shortfall) is None
+
+
+TIGHT = FATAL.replace("4105699328", "3700000000").replace("4506776321", "3970000000").replace("1073741824", "536870912")
+
+
+class _Ninfer:
+    """A stand-in for Server whose first start dies on the KV check, as on the box."""
+
+    starts: list = []
+
+    def __init__(self, binary, command, port, n_ctx=0):
+        self.command, self.port, self.n_ctx = command, port, n_ctx
+        self.base = f"http://127.0.0.1:{port}"
+        self.model_id = ""
+        _Ninfer.starts.append(self)
+
+    def start(self, seconds=0, on_wait=None):
+        if len(_Ninfer.starts) == 1:
+            raise server_engine.ServerUnavailable("exited with code 1 while loading.\n" + TIGHT)
+
+    def tail(self, lines=12):
+        return TIGHT if len(_Ninfer.starts) == 1 else ""
+
+    def close(self):
+        pass
+
+
+def test_a_kv_shortfall_is_retried_once_with_the_fitted_headroom(monkeypatch):
+    _Ninfer.starts = []
+    freed = []
+    monkeypatch.setattr(server_engine, "Server", _Ninfer)
+    monkeypatch.setattr(server_engine.runner, "free_comfy_vram", lambda device="auto": freed.append(device))
+    monkeypatch.setattr(server_engine, "vram_report", lambda: "report")
+    monkeypatch.setattr(server_engine, "free_port", lambda: 1234)
+    monkeypatch.setattr(server_engine.urllib.request, "urlopen", _models)
+    monkeypatch.delenv(server_engine.NINFER_HEADROOM_ENV, raising=False)
+    server = server_engine.open_server("ninfer-serve", "m.ninfer", "", -1, 32768, slots=2)
+    assert server is not None and len(_Ninfer.starts) == 2 and freed
+    first, second = (s.command[s.command.index("--vram-headroom-mib") + 1] for s in _Ninfer.starts)
+    assert first == str(server_engine.NINFER_HEADROOM_MIB)
+    assert int(second) < int(first)
+
+
+class _Models:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self):
+        return b'{"data": [{"id": "m"}]}'
+
+
+def _models(*_args, **_kwargs):
+    return _Models()
+
+
+def test_a_ninfer_that_cannot_fit_says_why(monkeypatch):
+    class Never(_Ninfer):
+        def start(self, seconds=0, on_wait=None):
+            raise server_engine.ServerUnavailable("exited while loading.\ncard: 1.00 GiB free")
+
+        def tail(self, lines=12):
+            return ""
+
+    Never.starts = []
+    monkeypatch.setattr(server_engine, "Server", Never)
+    monkeypatch.setattr(server_engine, "free_port", lambda: 1234)
+    assert server_engine.open_server("ninfer-serve", "m.ninfer", "", -1, 32768) is None
+    assert "1.00 GiB free" in server_engine.LAST_FAILURE

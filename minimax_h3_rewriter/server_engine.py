@@ -36,6 +36,7 @@ import base64
 import json
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -56,7 +57,15 @@ NINFER_SUFFIX = ".ninfer"
 NINFER_BIN_FILE = "ninfer_bin.txt"
 NINFER_SERVER = "ninfer-serve.exe" if os.name == "nt" else "ninfer-serve"
 NINFER_CONTEXT = 32768
+# ninfer-serve's own default headroom (1024 MiB) sits on top of the KV minimum
+# for the context asked for. This server lives for one run on a card ComfyUI
+# shares, so it takes less and refits from ninfer's own numbers when that is
+# still too much (see ``fit_headroom``).
+NINFER_HEADROOM_MIB = 512
+NINFER_HEADROOM_ENV = "MINIMAX_H3_NINFER_HEADROOM_MIB"
+NINFER_HEADROOM_SPARE_MIB = 32
 
+LAST_FAILURE = ""
 STARTUP_SECONDS = 900.0
 HEALTH_INTERVAL = 0.4
 
@@ -216,6 +225,86 @@ def ninfer_binary() -> str:
     return binary if os.path.isfile(binary) else ""
 
 
+def ninfer_headroom_mib() -> int:
+    raw = (os.environ.get(NINFER_HEADROOM_ENV) or "").strip()
+    try:
+        return max(0, int(raw)) if raw else NINFER_HEADROOM_MIB
+    except ValueError:
+        return NINFER_HEADROOM_MIB
+
+
+_KV_SHORTFALL = re.compile(
+    r"automatic KV capacity requires (\d+) bytes total \((\d+) minimum \+ (\d+) automatic headroom\), "
+    r"but only (\d+) bytes are available"
+)
+
+
+def kv_shortfall(text: str) -> dict | None:
+    """The numbers in ninfer-serve's "automatic KV capacity requires ..." failure, or None."""
+    found = _KV_SHORTFALL.search(text or "")
+    if not found:
+        return None
+    total, minimum, headroom, available = (int(x) for x in found.groups())
+    return {"total": total, "minimum": minimum, "headroom": headroom, "available": available}
+
+
+def fit_headroom(shortfall: dict) -> int | None:
+    """The headroom in MiB that makes ninfer's KV minimum fit, or None when no headroom can.
+
+    Uses the server's own report: whatever is left after the weights and the
+    minimum is the most the headroom can be, less a small spare.
+    """
+    spare = shortfall["available"] - shortfall["minimum"]
+    if spare < 0:
+        return None
+    return max(0, (spare >> 20) - NINFER_HEADROOM_SPARE_MIB)
+
+
+def vram_report() -> str:
+    """Free and total VRAM on the card, this process's share, and the other GPU servers running.
+
+    What a failed start needs in its message: how much was free and who held it.
+    nvidia-smi cannot name per-process memory under Windows WDDM, so the holders
+    are the processes that are known to take a card, with this one measured by torch.
+    """
+    gib = 1 << 30
+    parts = []
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits", "-i", "0"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        total, used = (int(x) for x in out.strip().split(","))
+        parts.append(f"card: {(total - used) / 1024:.2f} GiB free of {total / 1024:.2f} GiB")
+    except Exception:
+        parts.append("card: free memory unknown (nvidia-smi unavailable)")
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            parts.append(
+                f"this ComfyUI process (pid {os.getpid()}): {torch.cuda.memory_reserved() / gib:.2f} GiB reserved "
+                f"by torch, {torch.cuda.memory_allocated() / gib:.2f} GiB of it in tensors"
+            )
+    except Exception:
+        pass
+    try:
+        import psutil
+
+        keys = ("ninfer-serve", "llama-server", "strata")
+        seen = []
+        for process in psutil.process_iter(["pid", "name"]):
+            name = process.info.get("name") or ""
+            if process.info["pid"] != os.getpid() and any(key in name.lower() for key in keys):
+                seen.append(f"{name} (pid {process.info['pid']})")
+        parts.append("other GPU servers running: " + (", ".join(seen) if seen else "none"))
+    except Exception:
+        pass
+    return "; ".join(parts)
+
+
 def build_ninfer_command(
     binary: str,
     model_path: str,
@@ -223,13 +312,17 @@ def build_ninfer_command(
     n_ctx: int,
     slots: int = 1,
     reasoning: dict | None = None,
+    headroom_mib: int | None = None,
 ) -> list[str]:
     """ninfer-serve with the decode settings of the ninfer-custom fork's README.
 
     ``n_ctx`` is the per-request ceiling; the shared KV pool is sized by the
-    engine from what the card has left (``--kv-capacity auto``). Thinking stays
-    on by default and each request says whether to use it, as captions do.
+    engine from what the card has left (``--kv-capacity auto``), keeping
+    ``headroom_mib`` free. Thinking stays on by default and each request says
+    whether to use it, as captions do.
     """
+    if headroom_mib is None:
+        headroom_mib = ninfer_headroom_mib()
     command = [
         binary, model_path,
         "--host", HOST,
@@ -237,6 +330,7 @@ def build_ninfer_command(
         "--max-context", str(int(n_ctx)),
         "--max-concurrency", str(max(1, int(slots))),
         "--kv-capacity", "auto",
+        "--vram-headroom-mib", str(int(headroom_mib)),
         "--kv-dtype", "int8",
         "--spec", "dflash2", "--draft-tokens", "7", "--lm-head-draft",
         "--ngram-draft-tokens", "15", "--ngram-min-match", "12",
@@ -375,7 +469,7 @@ class Server:
             if self.process.poll() is not None:
                 raise ServerUnavailable(
                     f"{os.path.basename(self.binary)} exited with code "
-                    f"{self.process.returncode} while loading.\n{self.tail()}"
+                    f"{self.process.returncode} while loading.\n{self.tail()}\n{vram_report()}"
                 )
             if self._healthy():
                 return
@@ -561,27 +655,49 @@ def open_server(
     # writer's guide when that runs here too.
     pool = max(int(n_ctx_total or 0), int(n_ctx) * slots)
     ninfer = is_ninfer(model_path)
-    if ninfer:
-        command = build_ninfer_command(binary, model_path, port, -(-pool // slots), slots, reasoning)
-    else:
-        command = build_command(binary, model_path, mmproj_path, port, gpu_layers, pool,
-                                device, adapter_path, slots=slots, reasoning=reasoning)
-    server = Server(binary, command, port, n_ctx)
-    server.slots = slots
-    # ninfer-serve applies the chat template itself and honours enable_thinking
-    # on every request, so captions must say false there too.
-    server.thinking_aware = ninfer or reasoning is not None
-    if ninfer:
-        server.repeat_penalty = False
-    try:
-        server.start(on_wait=on_wait)
-    except ServerUnavailable as error:
-        log.info(
-            "[minimax_h3_rewriter.server_engine] %s -- describing one process at a "
-            "time instead", error,
-        )
-        server.close()
-        return None
+    headroom = ninfer_headroom_mib() if ninfer else None
+    attempts = 2 if ninfer else 1
+    server = None
+    for attempt in range(attempts):
+        if ninfer:
+            command = build_ninfer_command(binary, model_path, port, -(-pool // slots), slots, reasoning, headroom)
+        else:
+            command = build_command(binary, model_path, mmproj_path, port, gpu_layers, pool,
+                                    device, adapter_path, slots=slots, reasoning=reasoning)
+        server = Server(binary, command, port, n_ctx)
+        server.slots = slots
+        # ninfer-serve applies the chat template itself and honours enable_thinking
+        # on every request, so captions must say false there too.
+        server.thinking_aware = ninfer or reasoning is not None
+        if ninfer:
+            server.repeat_penalty = False
+        try:
+            server.start(on_wait=on_wait)
+            break
+        except ServerUnavailable as error:
+            shortfall = kv_shortfall(server.tail(STDERR_KEEP)) if ninfer else None
+            server.close()
+            fitted = fit_headroom(shortfall) if shortfall else None
+            if attempt + 1 < attempts and fitted is not None and fitted < headroom:
+                log.warning(
+                    "[minimax_h3_rewriter.server_engine] ninfer-serve found %.2f GiB free after the weights "
+                    "and needs %.2f GiB for its KV minimum plus %d MiB headroom; releasing ComfyUI's cached "
+                    "memory and trying once more with --vram-headroom-mib %d. %s",
+                    shortfall["available"] / (1 << 30), shortfall["minimum"] / (1 << 30), headroom, fitted,
+                    vram_report(),
+                )
+                runner.free_comfy_vram(device)
+                headroom = fitted
+                port = free_port()
+                continue
+            global LAST_FAILURE
+            LAST_FAILURE = str(error)
+            level = log.warning if ninfer else log.info
+            level(
+                "[minimax_h3_rewriter.server_engine] %s -- %s", error,
+                "ninfer-serve has no one-shot fallback" if ninfer else "describing one process at a time instead",
+            )
+            return None
     if ninfer:
         with urllib.request.urlopen(f"{server.base}/v1/models", timeout=10) as answer:
             server.model_id = json.load(answer)["data"][0]["id"]

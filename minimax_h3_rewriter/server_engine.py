@@ -336,7 +336,7 @@ def build_ninfer_command(
         "--ngram-draft-tokens", "15", "--ngram-min-match", "12",
         # The server lives for one run: a pinned host tier (8 GiB by default)
         # would only take RAM from ComfyUI's offloaded models.
-        "--host-cache-mib", "0",
+        "--host-context-mib", "0",
         "--vision",
         "--log-stats-panel", "off",
     ]

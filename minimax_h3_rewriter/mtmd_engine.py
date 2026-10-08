@@ -386,8 +386,17 @@ def session(
     auto_download: bool = True,
     adapter_path: str | None = None,
     progress: NodeProgress | None = None,
+    slots: int = 1,
+    force: bool = False,
+    reasoning: dict | None = None,
+    pool_ctx: int = 0,
 ):
     """Hold one model open for ``assets`` descriptions, when that is worth it.
+
+    ``slots`` > 1 lets that many descriptions run at once; ``force`` opens the
+    server even for one asset (or none), for a caller that will also write on
+    it; ``reasoning`` and ``pool_ctx`` are handed to the command line for that
+    writer -- see ``server_engine.build_command``.
 
     Yields something to pass to :func:`describe` as ``server``, or ``None``.
     ``None`` is not an error and is not rare -- one asset, a build with no
@@ -401,24 +410,37 @@ def session(
     and cost a round trip to say so.
     """
     device = devices.validate(device)
-    if not model_path or not mmproj_path or not server_engine.wanted(int(assets)):
-        yield None
-        return
+    ninfer = server_engine.is_ninfer(model_path)
+    if ninfer:
+        # No one-shot binary can read a .ninfer artifact: the server is the only path.
+        binary = server_engine.ninfer_binary()
+        if not binary:
+            raise RuntimeError(
+                f"{os.path.basename(model_path)} needs ninfer-serve: write the folder holding "
+                f"{server_engine.NINFER_SERVER} into {server_engine.NINFER_BIN_FILE} beside "
+                f"{llamacpp.bin_file()}."
+            )
+        context = int(n_ctx) if n_ctx > 0 else server_engine.NINFER_CONTEXT
+    else:
+        if not model_path or not mmproj_path or not (force or server_engine.wanted(int(assets))):
+            yield None
+            return
 
-    try:
-        captioner = llamacpp.ensure_mtmd(backend, auto_download, progress)
-    except Exception:
-        log.info(
-            "[minimax_h3_rewriter.mtmd_engine.session] no runtime to hold open",
-            exc_info=True,
-        )
-        yield None
-        return
+        try:
+            captioner = llamacpp.ensure_mtmd(backend, auto_download, progress)
+        except Exception:
+            log.info(
+                "[minimax_h3_rewriter.mtmd_engine.session] no runtime to hold open",
+                exc_info=True,
+            )
+            yield None
+            return
 
-    binary = llamacpp.server_beside(captioner)
-    if not binary:
-        yield None
-        return
+        binary = llamacpp.server_beside(captioner)
+        if not binary:
+            yield None
+            return
+        context = fit_context(model_path, mmproj_path, attachments, device, n_ctx)
 
     if progress is not None:
         progress.text(
@@ -426,15 +448,26 @@ def session(
             force=True,
         )
     runner.free_comfy_vram(device)
+    if device != devices.CPU:
+        weights = sum(os.path.getsize(path) for path in (model_path, mmproj_path) if path and os.path.isfile(path))
+        runner.ensure_vram(weights + runner.VRAM_MARGIN, os.path.basename(model_path))
     server = server_engine.open_server(
         binary,
         model_path,
         mmproj_path,
         gpu_layers,
-        fit_context(model_path, mmproj_path, attachments, device, n_ctx),
+        context,
         device,
         adapter_path,
+        slots=int(slots),
+        reasoning=reasoning,
+        n_ctx_total=int(pool_ctx),
     )
+    if server is None and ninfer:
+        raise RuntimeError(
+            f"ninfer-serve could not start {os.path.basename(model_path)}; the reason is in the "
+            "ComfyUI log above (minimax_h3_rewriter.server_engine)."
+        )
     try:
         yield server
     finally:
@@ -563,6 +596,7 @@ def describe(
                 text, stderr_text = server.ask(
                     instruction, attachments, seed, greedy, max_new_tokens,
                     temperature, top_p, top_k, system_prompt, report,
+                    enable_thinking=False if getattr(server, "thinking_aware", False) else None,
                 ), ""
             else:
                 text, stderr_text = runner.run(command, binary, report)

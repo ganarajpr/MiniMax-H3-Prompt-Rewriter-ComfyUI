@@ -28,8 +28,11 @@ dropdown for every one of them and the node still runs.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from comfy_api.latest import io
@@ -39,15 +42,18 @@ from . import (
     checks,
     clip_caption,
     guide_prompt,
+    guides,
     library,
     media,
     memory,
     mtmd_engine,
     previews,
+    server_engine,
     snapshot,
 )
 from .constants import (
     RESOLUTIONS,
+    answer_only,
     duration_options,
 )
 from .fields import ALL_FIELDS, split_sections
@@ -64,6 +70,7 @@ from .nodes import (
     _fix_once,
     _report,
     _resolve_captioner_choice,
+    _resolve_writer_choice,
     caption_question,
     captioner_choices,
     next_index,
@@ -71,6 +78,7 @@ from .nodes import (
     writer_choices,
 )
 from .multi_caption import _check_encoders
+from .paths import catalog_file
 from .progress import NodeProgress, announce, refuse
 from .references import SLOTS_OUTPUT_TOOLTIP, SLOTS_TYPE, slot_bundle
 
@@ -609,58 +617,126 @@ class MiniMaxH3UniversalWriter(io.ComfyNode):
 
         captions: list[str] = []
         empty: list[str] = []
+        model_path = mmproj_path = None
+        writer_choice = _resolve_writer_choice(writer_model)
+        # A catalog entry is not "local" even when its file is on this machine;
+        # catalog_file() is how the pack finds it without downloading.
+        writer_file = writer_choice.reference if writer_choice.local else (
+            catalog_file(writer_choice.reference, writer_choice.file) or ""
+        )
+        if writer_file and not os.path.isfile(writer_file):
+            writer_file = ""
+        # The captioner is resolved whenever references need reading -- and also
+        # when the writer is the same GGUF already on disk: one llama-server then
+        # serves the captions and the rewrite from a single load, and llama.cpp's
+        # reasoning flags apply to the writer.
+        if clip is None and (assets or writer_file):
+            choice = _resolve_captioner_choice(caption_model)
+            on_disk = (
+                catalog_file(choice.reference, choice.file),
+                catalog_file(choice.reference, choice.mmproj),
+            )
+            if choice.local:
+                model_path, mmproj_path = choice.reference, choice.mmproj
+            elif server_engine.is_ninfer(on_disk[0]) and os.path.isfile(on_disk[0]):
+                model_path, mmproj_path = on_disk[0], ""
+            elif all(on_disk) and all(os.path.isfile(path) for path in on_disk):
+                model_path, mmproj_path = on_disk
+            elif assets:
+                model_path, mmproj_path = _ensure_pair(
+                    choice.reference, choice.file, choice.mmproj, "Captioner",
+                    settings, progress,
+                )
         if assets:
             kinds = {asset.kind for asset in assets}
-            model_path = mmproj_path = None
-            if clip is None:
-                choice = _resolve_captioner_choice(caption_model)
-                if choice.local:
-                    model_path, mmproj_path = choice.reference, choice.mmproj
-                else:
-                    model_path, mmproj_path = _ensure_pair(
-                        choice.reference, choice.file, choice.mmproj, "Captioner",
-                        settings, progress,
-                    )
-                _check_encoders(mmproj_path, kinds)
-            else:
+            if clip is not None:
                 clip_caption.check(clip, kinds)
+            elif mmproj_path:  # a .ninfer artifact carries its own vision tower, no mmproj to inspect
+                _check_encoders(mmproj_path, kinds)
 
-            asked_for = slot_instructions(reference_instructions)
+        def _same(a: str, b: str) -> bool:
+            return bool(a and b) and os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
-            with mtmd_engine.session(
+        writer_on_server = clip is None and _same(writer_file, model_path or "")
+        thinking = bool(settings.get("thinking", False))
+        budget = int(settings.get("reasoning_budget", -1))
+        reasoning = {
+            "enabled": thinking and writer_on_server,
+            "budget": budget,
+            "message": str(settings.get("reasoning_budget_message", "") or ""),
+        }
+        if thinking and not writer_on_server:
+            note = (
+                "thinking is on, but it only applies when the writer runs on the captioning "
+                "server (writer_model must be the same GGUF as caption_model, and no 'clip' "
+                "connected) -- writing with thinking off"
+            )
+            log.info("[minimax_h3_rewriter.universal] %s", note)
+            progress.text(note, force=True)
+            announce(cls.hidden.unique_id, [("warn", note)])
+
+        given_system = (system_prompt or "").strip()
+        guide = ""
+        writer_budget = int(settings["max_new_tokens"]) + (max(budget, 0) if reasoning["enabled"] else 0)
+        pool_ctx = 0
+        if writer_on_server:
+            guide = "" if given_system else guides.text(
+                guide_prompt.GUIDE_FOR_MODE[task], settings["auto_download"], progress
+            )
+            # The pool has to hold the guide, the task, a reference block that
+            # does not exist yet (allow ~400 tokens per asset) and the answer.
+            stand_in = "" if task == TEXT_TASK else "x" * (1600 * max(len(assets), 1))
+            rough = guide_prompt.build_messages(
+                guide, task, prompt, resolution, duration, stand_in, system=given_system
+            )
+            pool_ctx = guide_prompt.context_needed(rough, writer_budget)
+
+        slots = max(1, min(len(assets), int(settings.get("caption_parallel", 1)))) if assets else 1
+        asked_for = slot_instructions(reference_instructions)
+
+        if (assets and clip is None) or writer_on_server:
+            session = mtmd_engine.session(
                 model_path or "", mmproj_path or "",
                 assets=len(assets),
                 attachments=mtmd_engine.busiest(
                     (asset.kind for asset in assets), int(max_frames)
-                ),
+                ) if assets else 1,
                 gpu_layers=int(settings["gpu_layers"]),
                 n_ctx=int(context_size),
                 device=settings["device"],
                 backend=settings["llama_backend"],
                 auto_download=settings["auto_download"],
                 progress=progress,
-            ) as batch:
-                progress.set_total(len(assets))
-                for done, asset in enumerate(assets):
-                    index = next_index(block, asset.role)
-                    progress.update(
-                        done,
-                        f"{asset.role} {index}: reading {asset.slot} ({done + 1} of {len(assets)})",
-                    )
+                slots=slots,
+                force=writer_on_server,
+                reasoning=reasoning if writer_on_server else None,
+                pool_ctx=pool_ctx,
+            )
+        else:
+            session = contextlib.nullcontext(None)
 
+        with session as batch:
+            if assets:
+                # Number the labels first, so the descriptions can arrive in any order.
+                indices: list[int] = []
+                probe = block
+                for asset in assets:
+                    index = next_index(probe, asset.role)
+                    indices.append(index)
+                    probe = f"{probe}\n{asset.role} {index}: ...".strip()
+
+                def caption_one(asset, index, report_to):
                     asked = caption_question(
                         asset.role, caption_length, asked_for.get(asset.slot)
                     )
                     note = _clip_note(asset, max_frames)
                     if note:
                         asked = f"{note}\n\n{asked}"
-
                     as_image = asset.value if asset.kind == "image" else None
                     as_audio = asset.value if asset.kind == "audio" else None
                     as_video = asset.value if asset.kind == "video" else None
-
                     if clip is not None:
-                        caption = clip_caption.describe(
+                        return clip_caption.describe(
                             clip,
                             instruction=asked,
                             image=as_image,
@@ -669,32 +745,59 @@ class MiniMaxH3UniversalWriter(io.ComfyNode):
                             max_frames=int(max_frames),
                             seed=int(seed),
                             settings=settings,
-                            progress=progress,
+                            progress=report_to,
                         )
-                    else:
-                        caption = mtmd_engine.describe(
-                            model_path=model_path,
-                            mmproj_path=mmproj_path,
-                            instruction=asked,
-                            image=as_image,
-                            audio=as_audio,
-                            video=as_video,
-                            max_frames=int(max_frames),
-                            gpu_layers=int(settings["gpu_layers"]),
-                            n_ctx=int(context_size),
-                            seed=int(seed),
-                            greedy=True,
-                            max_new_tokens=min(int(settings["max_new_tokens"]), 1024),
-                            temperature=float(settings["temperature"]),
-                            top_p=float(settings["top_p"]),
-                            top_k=int(settings["top_k"]),
-                            device=settings["device"],
-                            backend=settings["llama_backend"],
-                            auto_download=settings["auto_download"],
-                            progress=progress,
-                            server=batch,
-                        )
+                    return mtmd_engine.describe(
+                        model_path=model_path,
+                        mmproj_path=mmproj_path,
+                        instruction=asked,
+                        image=as_image,
+                        audio=as_audio,
+                        video=as_video,
+                        max_frames=int(max_frames),
+                        gpu_layers=int(settings["gpu_layers"]),
+                        n_ctx=int(context_size),
+                        seed=int(seed),
+                        greedy=True,
+                        max_new_tokens=min(int(settings["max_new_tokens"]), 1024),
+                        temperature=float(settings["temperature"]),
+                        top_p=float(settings["top_p"]),
+                        top_k=int(settings["top_k"]),
+                        device=settings["device"],
+                        backend=settings["llama_backend"],
+                        auto_download=settings["auto_download"],
+                        progress=report_to,
+                        server=batch,
+                    )
 
+                progress.set_total(len(assets))
+                results: list[str] = []
+                if batch is not None and slots > 1 and len(assets) > 1:
+                    progress.text(
+                        f"Describing {len(assets)} references at once on {slots} server slots",
+                        force=True,
+                    )
+                    log.info(
+                        "[minimax_h3_rewriter.universal] describing %d references in parallel (%d slots)",
+                        len(assets), slots,
+                    )
+                    with ThreadPoolExecutor(max_workers=slots) as pool:
+                        futures = [
+                            pool.submit(caption_one, asset, index, None)
+                            for asset, index in zip(assets, indices)
+                        ]
+                        for done, future in enumerate(futures):
+                            results.append(future.result())
+                            progress.update(done + 1, f"{done + 1} of {len(assets)} described")
+                else:
+                    for done, (asset, index) in enumerate(zip(assets, indices)):
+                        progress.update(
+                            done,
+                            f"{asset.role} {index}: reading {asset.slot} ({done + 1} of {len(assets)})",
+                        )
+                        results.append(caption_one(asset, index, progress))
+
+                for asset, index, caption in zip(assets, indices, results):
                     caption = " ".join(caption.split())
                     if not caption:
                         empty.append(f"{asset.role} {index} ({asset.slot})")
@@ -705,36 +808,74 @@ class MiniMaxH3UniversalWriter(io.ComfyNode):
                     captions.append(caption)
                     block = f"{block}\n{asset.role} {index}: {caption}".strip()
 
-            described = f"{len(assets)} described"
-            if skipped:
-                described += f", {skipped} switched off"
-            if empty:
-                silence = (
-                    f"nothing came back for {', '.join(empty)}. Those labels are in "
-                    f"the block with nothing after them, so the writer has been told an asset "
-                    f"exists and not what it is -- try another captioner."
+                described = f"{len(assets)} described"
+                if skipped:
+                    described += f", {skipped} switched off"
+                if empty:
+                    silence = (
+                        f"nothing came back for {', '.join(empty)}. Those labels are in "
+                        f"the block with nothing after them, so the writer has been told an asset "
+                        f"exists and not what it is -- try another captioner."
+                    )
+                    described = f"WARNING: {silence}\n{described}"
+                    announce(cls.hidden.unique_id, [("warn", silence)])
+                progress.update(len(assets), f"{described}\n{block}")
+
+            material = "" if task == TEXT_TASK else block
+
+            def write(extra: str = "") -> str:
+                if batch is None or not writer_on_server:
+                    return _guided_text(
+                        task, writer_model, prompt + extra, resolution, duration, material,
+                        greedy, seed, keep_model_loaded, settings, progress, system_prompt,
+                    )
+                messages = guide_prompt.build_messages(
+                    guide, task, prompt + extra, resolution, duration, material, system=given_system
                 )
-                described = f"WARNING: {silence}\n{described}"
-                announce(cls.hidden.unique_id, [("warn", silence)])
-            progress.update(len(assets), f"{described}\n{block}")
+                head = f"Writing {task} on the loaded {os.path.basename(model_path)}"
+                if reasoning["enabled"]:
+                    head += f" (thinking, budget {budget})"
+                log.info("[minimax_h3_rewriter.universal] %s", head)
+                progress.set_total(max(writer_budget, 1))
+                progress.text(head, force=True)
 
-        material = "" if task == TEXT_TASK else block
-        text = _guided_text(
-            task, writer_model, prompt, resolution, duration, material,
-            greedy, seed, keep_model_loaded, settings, progress, system_prompt,
-        )
+                def report(whole: str) -> bool:
+                    progress.update(
+                        min(len(whole) / 4.0, float(writer_budget)),
+                        f"Writing · {len(whole)} chars\n{whole[-300:]}",
+                    )
+                    return bool(checks.looping(whole))
 
-        names = guide_prompt.FIELDS_FOR_MODE[task]
-        text = _fix_once(
-            text, progress,
-            lambda extra: _guided_text(
-                task, writer_model, prompt + extra, resolution, duration, material,
-                greedy, seed, keep_model_loaded, settings, progress, system_prompt,
-            ),
-            names, task=task, duration=duration,
-            having=[item.kind for item in assets],
-            fallback=guide_prompt.BODY_FIELD[task], settings=settings,
-        )
+                def thinking_so_far(whole: str) -> None:
+                    progress.update(
+                        min(len(whole) / 4.0, float(writer_budget)),
+                        f"Thinking · {len(whole)} chars\n{whole[-300:]}",
+                    )
+
+                text = batch.chat(
+                    messages,
+                    seed=int(seed),
+                    greedy=greedy,
+                    max_new_tokens=writer_budget,
+                    temperature=float(settings["temperature"]),
+                    top_p=float(settings["top_p"]),
+                    top_k=int(settings["top_k"]),
+                    repeat_penalty=float(settings["repetition_penalty"]),
+                    enable_thinking=reasoning["enabled"],
+                    on_text=report,
+                    on_reasoning=thinking_so_far if reasoning["enabled"] else None,
+                )
+                return answer_only(text.replace("\r\n", "\n"))
+
+            text = write()
+            names = guide_prompt.FIELDS_FOR_MODE[task]
+            text = _fix_once(
+                text, progress, write,
+                names, task=task, duration=duration,
+                having=[item.kind for item in assets],
+                fallback=guide_prompt.BODY_FIELD[task], settings=settings,
+            )
+
         _head, sections = split_sections(text, names, fallback=guide_prompt.BODY_FIELD[task])
         _report(
             progress, text, sections, names,

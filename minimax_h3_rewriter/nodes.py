@@ -30,6 +30,7 @@ from . import (
     mtmd_engine,
     ollama_store,
     repair,
+    server_engine,
 )
 from .catalog import FORMAT_GGUF, FORMAT_TRANSFORMERS
 from .constants import (
@@ -92,6 +93,10 @@ DEFAULT_OPTIONS = {
     "prompt_file": library.DEFAULT_FILE,
     "self_check": checks.REPORT_ALL,
     "fix_once": False,
+    "caption_parallel": 3,
+    "thinking": False,
+    "reasoning_budget": 4096,
+    "reasoning_budget_message": "",
 }
 
 BASE_SPEC = {
@@ -270,7 +275,7 @@ def _build_captioner_map() -> dict[str, CaptionerChoice]:
     mapping: dict[str, CaptionerChoice] = {}
     try:
         for entry in catalog.captioners():
-            if not entry.mmproj:
+            if not entry.mmproj and not server_engine.is_ninfer(entry.file):
                 log.warning(
                     "[minimax_h3_rewriter._build_captioner_map] '%s' has no 'mmproj', skipping",
                     entry.name,
@@ -963,6 +968,52 @@ class MiniMaxH3RewriterOptions:
                             "file that is already complete is never fetched twice either way.\n\n"
                             "Cancelling stops between files at once; inside a file it can take "
                             "a moment on the Xet path."
+                        ),
+                    },
+                ),
+                "caption_parallel": (
+                    "INT",
+                    {
+                        "default": 3, "min": 1, "max": 8,
+                        "tooltip": (
+                            "Universal Writer only: how many references are described at the same "
+                            "time when a captioning server is running (two or more references). "
+                            "Each one takes a server slot; the KV cache pool grows with it."
+                        ),
+                    },
+                ),
+                "thinking": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Universal Writer only, and only when writer_model is the same GGUF as "
+                            "caption_model: the rewrite then runs on the captioning llama-server, "
+                            "and a thinking model (Qwen3.x, Swift) is allowed to deliberate before "
+                            "it writes. Off everywhere else, as before."
+                        ),
+                    },
+                ),
+                "reasoning_budget": (
+                    "INT",
+                    {
+                        "default": 4096, "min": -1, "max": 32768, "step": 64,
+                        "tooltip": (
+                            "Token budget for that thinking (llama.cpp --reasoning-budget): -1 is "
+                            "unrestricted, N stops the deliberation after N tokens. Added on top "
+                            "of max_new_tokens for the request."
+                        ),
+                    },
+                ),
+                "reasoning_budget_message": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": (
+                            "Text injected before the end-of-thinking tag when the budget runs out "
+                            "(llama.cpp --reasoning-budget-message), e.g. 'Time is up - write the "
+                            "answer now.' Empty leaves llama.cpp's default."
                         ),
                     },
                 ),

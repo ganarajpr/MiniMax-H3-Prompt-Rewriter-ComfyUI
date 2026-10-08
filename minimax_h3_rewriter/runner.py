@@ -204,6 +204,82 @@ def free_comfy_vram(device: str = "auto") -> None:
         log.debug("[minimax_h3_rewriter.runner.free_comfy_vram] skipped", exc_info=True)
 
 
+# A local GPU gateway (one backend on the card at a time) can hold a model this
+# process cannot see or unload. Asking it for ComfyUI's turn evicts that model.
+GATEWAY_ENV = "MINIMAX_H3_GPU_GATEWAY"
+GATEWAY_DEFAULT = "http://127.0.0.1:9000"
+VRAM_MARGIN = 4 << 30
+
+
+def _free_vram() -> int | None:
+    """Free memory on GPU 0 across every process.
+
+    Not torch.cuda.mem_get_info(): under Windows WDDM it reports this process's
+    budget and ignores what other processes hold (the driver can page them out),
+    so a card another server has filled still reads as free.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits", "-i", "0"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        total, used = (int(x) for x in out.strip().split(","))
+        return (total - used) << 20
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        import torch
+
+        return int(torch.cuda.mem_get_info()[0]) if torch.cuda.is_available() else None
+    except Exception:
+        return None
+
+
+def _claim_from_gateway() -> str:
+    """Ask the gateway to give ComfyUI the card; returns what it said, or "" with no gateway."""
+    import urllib.error
+    import urllib.request
+
+    url = (os.environ.get(GATEWAY_ENV) or GATEWAY_DEFAULT).rstrip("/") + "/comfyui/free"
+    request = urllib.request.Request(url, data=b"{}", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=180) as answer:
+            return f"HTTP {answer.status}"
+    except urllib.error.HTTPError as error:
+        return f"HTTP {error.code}: {error.read().decode('utf-8', 'replace')[:200]}"
+    except (urllib.error.URLError, OSError):
+        return ""
+
+
+def ensure_vram(needed: int, label: str) -> None:
+    """Refuse to load ``label`` onto a card that does not have room for it.
+
+    Loading anyway does not fail on Windows: the driver pages the other tenant's
+    memory out to system RAM and every step then crawls over PCIe. Something
+    outside ComfyUI (a gateway's llama or ninfer, another app) is the usual
+    reason, so the gateway is asked for the card once before giving up.
+    """
+    free = _free_vram()
+    if free is None or free >= needed:
+        return
+    gib = 1 << 30
+    log.info(
+        "[minimax_h3_rewriter.runner.ensure_vram] %.1f GiB free, %s needs about %.1f GiB: asking "
+        "the GPU gateway for the card", free / gib, label, needed / gib,
+    )
+    said = _claim_from_gateway()
+    after = _free_vram() or 0
+    if after >= needed:
+        log.info("[minimax_h3_rewriter.runner.ensure_vram] %.1f GiB free after the gateway (%s)", after / gib, said)
+        return
+    raise RuntimeError(
+        f"Not enough free VRAM for {label}: {after / gib:.1f} GiB free, about {needed / gib:.1f} GiB "
+        f"needed. Something outside ComfyUI is holding the card"
+        + (f" and the GPU gateway did not free it ({said})" if said else " and no GPU gateway answered")
+        + ". Stop it (or open ComfyUI through the gateway so it can evict llama/ninfer) and queue again."
+    )
+
+
 def interrupted() -> bool:
     try:
         import comfy.model_management as mm
